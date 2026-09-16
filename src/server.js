@@ -1331,9 +1331,39 @@ proxy.on("error", (err, _req, res) => {
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
+//
+// /v1/* is the OpenClaw Gateway HTTP API (e.g. OpenResponses). Server-to-server
+// callers (Control Center) authenticate with Bearer OPENCLAW_GATEWAY_TOKEN.
+// Never open /v1 without validating the Bearer token — attachGatewayAuthHeader()
+// would otherwise inject the gateway token for unauthenticated requests.
+function tokensEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    if (bufA.length > 0) crypto.timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
+
+  // Server-to-server Gateway API: require Bearer OPENCLAW_GATEWAY_TOKEN (not Basic).
+  if (req.path === "/v1" || req.path.startsWith("/v1/")) {
+    if (!OPENCLAW_GATEWAY_TOKEN) {
+      return res.status(401).send("Auth required");
+    }
+    const header = req.headers.authorization || "";
+    const [scheme, token] = header.split(" ");
+    if (scheme !== "Bearer" || !token || !tokensEqual(token, OPENCLAW_GATEWAY_TOKEN)) {
+      return res.status(401).send("Auth required");
+    }
+    return next();
+  }
+
   if (!SETUP_PASSWORD) return next(); // no password configured → open
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
