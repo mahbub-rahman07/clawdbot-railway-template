@@ -297,7 +297,16 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+// Skip JSON body parsing for /v1/* so http-proxy can stream the raw request body
+// to the OpenClaw Gateway. Consuming the stream here causes OpenClaw 408
+// "Request body timeout" (Content-Length set, body already exhausted).
+const jsonParser = express.json({ limit: "1mb" });
+app.use((req, res, next) => {
+  if (req.path === "/v1" || req.path.startsWith("/v1/")) {
+    return next();
+  }
+  return jsonParser(req, res, next);
+});
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
