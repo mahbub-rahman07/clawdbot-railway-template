@@ -1310,10 +1310,13 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
 });
 
 // Proxy everything else to the gateway.
+// xfwd must stay false: http-proxy's xfwd appends client-supplied X-Forwarded-*
+// values, which OpenClaw rejects (proxy_attribution_required). We sanitize and
+// rebuild attribution ourselves before forwarding.
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
-  xfwd: true,
+  xfwd: false,
 });
 
 proxy.on("error", (err, _req, res) => {
@@ -1327,6 +1330,24 @@ proxy.on("error", (err, _req, res) => {
     // ignore
   }
 });
+
+// OpenClaw trusts this wrapper (127.0.0.1 in gateway.trustedProxies) only if we
+// overwrite forwarded client headers instead of preserving client-supplied ones.
+function sanitizeProxyAttributionHeaders(req) {
+  if (!req?.headers) return;
+  const headers = req.headers;
+  delete headers.forwarded;
+  delete headers["x-forwarded-for"];
+  delete headers["x-real-ip"];
+  delete headers["x-forwarded-host"];
+  delete headers["x-forwarded-proto"];
+  delete headers["x-forwarded-port"];
+
+  const remote = req.socket?.remoteAddress || req.connection?.remoteAddress;
+  if (remote) {
+    headers["x-forwarded-for"] = remote;
+  }
+}
 
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
@@ -1391,8 +1412,40 @@ function attachGatewayAuthHeader(req) {
   }
 }
 
-proxy.on("proxyReqWs", (_proxyReq, req) => {
+proxy.on("proxyReq", (proxyReq, req) => {
+  // Force overwrite on the outbound request (never preserve client-supplied values).
+  for (const name of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+  ]) {
+    proxyReq.removeHeader(name);
+  }
+  const remote = req.socket?.remoteAddress || req.connection?.remoteAddress;
+  if (remote) {
+    proxyReq.setHeader("x-forwarded-for", remote);
+  }
+});
+
+proxy.on("proxyReqWs", (proxyReq, req) => {
   attachGatewayAuthHeader(req);
+  for (const name of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+  ]) {
+    proxyReq.removeHeader(name);
+  }
+  const remote = req.socket?.remoteAddress || req.connection?.remoteAddress;
+  if (remote) {
+    proxyReq.setHeader("x-forwarded-for", remote);
+  }
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
@@ -1417,6 +1470,7 @@ app.use(requireDashboardAuth, async (req, res) => {
     }
   }
 
+  sanitizeProxyAttributionHeaders(req);
   attachGatewayAuthHeader(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
@@ -1504,6 +1558,7 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+  sanitizeProxyAttributionHeaders(req);
   attachGatewayAuthHeader(req);
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
